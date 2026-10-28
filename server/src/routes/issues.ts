@@ -309,11 +309,8 @@ import {
 } from "../services/issues.js";
 import {
   authorizationDeniedDetails,
-  canActorReadProjectPrivacy,
-  issuePrivacyMode,
   issueReadSqlCondition,
   projectReadSqlCondition,
-  taskBridgeScopeIds,
 } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
 import { environmentService } from "../services/environments.js";
@@ -4955,32 +4952,6 @@ export function issueRoutes(
       req.actor.source === "agent_key" &&
       req.actor.keyScope?.kind === "task_bridge"
     );
-  }
-
-  function taskBridgeKeyScopesProject(req: Request, projectId: string) {
-    if (!isTaskBridgeKeyActor(req) || req.actor.keyScope?.kind !== "task_bridge") return false;
-    return taskBridgeScopeIds(req.actor.keyScope, "projectId", "projectIds").includes(projectId);
-  }
-
-  async function canActorUseProjectForCreate(
-    req: Request,
-    project: { id: string; companyId: string; visibility: string },
-  ) {
-    if (!taskBridgeKeyScopesProject(req, project.id)) return canActorReadProject(req, project);
-    const mode = issuePrivacyMode();
-    const authorizingUserId = req.actor.type === "agent" ? req.actor.authorizingUserId : undefined;
-    if (!authorizingUserId && mode === "off") return true;
-    if (await canActorReadProjectPrivacy(db, req.actor, project)) return true;
-    logger.warn({
-      authzMode: mode,
-      action: "project:read",
-      companyId: project.companyId,
-      projectId: project.id,
-      actorType: req.actor.type,
-      actorAgentId: req.actor.agentId ?? null,
-      reason: "deny_project_private",
-    }, "project privacy would deny read");
-    return !authorizingUserId && mode === "shadow";
   }
 
   function isSkillTestScopedActor(req: Request) {
@@ -12568,7 +12539,12 @@ export function issueRoutes(
         res.status(404).json({ error: "Project not found" });
         return;
       }
-      if (!(await canActorUseProjectForCreate(req, selectedProject))) {
+      const projectDecision = await access.decideProjectForIssueCreate({
+        actor: req.actor,
+        companyId,
+        projectId: selectedProject.id,
+      });
+      if (!projectDecision.allowed) {
         res.status(404).json({ error: "Project not found" });
         return;
       }
