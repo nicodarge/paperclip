@@ -17,6 +17,7 @@ import {
   getSandboxBridgeProcessBodyLedgerSource,
   getSandboxCallbackBridgeServerSource,
   HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
+  isSandboxGoneError,
   sandboxCallbackBridgeDirectories,
   syncRemoteTextFileWithHashSkip,
   syncSandboxCallbackBridgeEntrypoint,
@@ -2459,6 +2460,85 @@ describe("sandbox callback bridge", () => {
     expect(responseWrites.some((write) => write.status === 502)).toBe(false);
 
     await worker.stop({ drainTimeoutMs: 10 });
+  });
+
+  it("stops re-arming the 504 backstop once the provider reports the sandbox is gone", async () => {
+    const waitFor = createWorkerWaiter();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const queueDir = "/virtual-bridge/queue";
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requestFile = "req-gone.json";
+    const requestPath = path.posix.join(directories.requestsDir, requestFile);
+
+    const requestBodies = new Map<string, string>();
+    requestBodies.set(requestPath, bridgeRequestJson("req-gone"));
+    let writeAttempts = 0;
+    let sandboxGone = false;
+
+    const client: SandboxCallbackBridgeQueueClient = {
+      ...virtualQueueReadClient(directories, requestBodies),
+      writeResponseFile: async () => {
+        writeAttempts += 1;
+        sandboxGone = true;
+        throw new Error(
+          'Broker request failed with status 404: {"error":"not_found","message":"No such sandbox"}',
+        );
+      },
+      listJsonFiles: async (remotePath) => {
+        if (sandboxGone) {
+          throw new Error(
+            'Broker request failed with status 404: {"error":"not_found","message":"No such sandbox"}',
+          );
+        }
+        return remotePath === directories.requestsDir ? [requestFile] : [];
+      },
+      rename: async () => {},
+      remove: async (remotePath) => {
+        requestBodies.delete(remotePath);
+      },
+    };
+
+    const { runtimeSpan } = createWorkerErrorCapture();
+
+    const worker = await startSandboxCallbackBridgeWorker({
+      client,
+      queueDir,
+      iterationTimeoutMs: 50,
+      watchdogTimeoutMs: 10_000,
+      abortedHandlerGraceMs: 20,
+      runtimeSpan,
+      authorizeRequest: async () => null,
+      handleRequest: () => new Promise<{ status: number; body?: string }>(() => {}),
+    });
+
+    try {
+      await waitFor(() => writeAttempts > 0, 3_000);
+      await worker.stop({ drainTimeoutMs: 10 });
+      // Many grace periods: the old code re-armed every 20ms and kept writing.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      expect(writeAttempts).toBe(1);
+      const backstopLines = warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.includes("req-gone") && line.includes("backstop"));
+      expect(backstopLines).toHaveLength(1);
+      expect(backstopLines[0]).toContain("dropped the 504 backstop for req-gone: the sandbox no longer exists");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("classifies only sandbox-gone provider errors as terminal", () => {
+    expect(isSandboxGoneError(new Error(
+      'Broker request failed with status 404: {"error":"not_found","message":"No such sandbox"}',
+    ))).toBe(true);
+    expect(isSandboxGoneError(new Error("wrapper", { cause: new Error("No such sandbox") }))).toBe(true);
+    expect(isSandboxGoneError(new Error("simulated transient write failure"))).toBe(false);
+    expect(isSandboxGoneError(new Error("Sandbox callback bridge write 504 backstop for x timed out after 50ms."))).toBe(false);
+    expect(isSandboxGoneError(new Error('Broker request failed with status 404: {"error":"no_route"}'))).toBe(false);
+    expect(isSandboxGoneError(new Error('Broker request failed with status 500: {"error":"not_found"}'))).toBe(false);
+    expect(isSandboxGoneError(undefined)).toBe(false);
   });
 
   it("retries a handler response write that fails transiently and delivers the real response, not a retryable 503", async () => {

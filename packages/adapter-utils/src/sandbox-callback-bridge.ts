@@ -354,6 +354,26 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
+// Provider errors cross the plugin RPC boundary as message text only. A sandbox
+// the provider no longer has fails every later queue write the same way, so a
+// retry can never land.
+const SANDBOX_GONE_ERROR_PATTERNS: readonly RegExp[] = [
+  /\bno such sandbox\b/i,
+  /\bstatus 404\b[\s\S]*"error"\s*:\s*"not_found"/i,
+];
+
+export function isSandboxGoneError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current !== undefined && current !== null; depth += 1) {
+    const message = current instanceof Error ? current.message : typeof current === "string" ? current : "";
+    if (SANDBOX_GONE_ERROR_PATTERNS.some((pattern) => pattern.test(message))) {
+      return true;
+    }
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return false;
+}
+
 function toBuffer(bytes: Buffer | Uint8Array | ArrayBuffer): Buffer {
   if (Buffer.isBuffer(bytes)) return bytes;
   if (bytes instanceof ArrayBuffer) return Buffer.from(bytes);
@@ -1028,6 +1048,12 @@ export async function startSandboxCallbackBridgeWorker(input: {
           return;
         } catch (error) {
           lastWriteError = error instanceof Error ? error.message : String(error);
+          if (isSandboxGoneError(error)) {
+            console.warn(
+              `[paperclip] sandbox callback bridge dropped the response for ${response.id}: the sandbox no longer exists: ${lastWriteError}`,
+            );
+            return;
+          }
           console.warn(
             `[paperclip] sandbox callback bridge failed to write response for ${response.id} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${lastWriteError}`,
           );
@@ -1257,8 +1283,18 @@ export async function startSandboxCallbackBridgeWorker(input: {
         await input.client.remove(requestPath).catch(() => undefined);
         return;
       } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        if (isSandboxGoneError(error)) {
+          // Nothing can ever read a response from a sandbox that is gone. Keep the
+          // fence set and the guard in the map, so neither a late handler nor the
+          // poll loop touches the request again, and do not re-arm.
+          console.warn(
+            `[paperclip] sandbox callback bridge dropped the 504 backstop for ${requestId}: the sandbox no longer exists: ${errorMessage}`,
+          );
+          return;
+        }
         console.warn(
-          `[paperclip] sandbox callback bridge failed to write 504 backstop for ${requestId} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${error instanceof Error ? error.message : String(error)}`,
+          `[paperclip] sandbox callback bridge failed to write 504 backstop for ${requestId} (attempt ${attempt}/${MAX_BACKSTOP_WRITE_ATTEMPTS}): ${errorMessage}`,
         );
         if (attempt < MAX_BACKSTOP_WRITE_ATTEMPTS) {
           await new Promise((resolve) => setTimeout(resolve, BACKSTOP_WRITE_RETRY_MS));
